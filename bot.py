@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 import logging
 import asyncio
 import httpx
@@ -142,6 +143,33 @@ async def call_claude(prompt: str) -> str:
     return message.content[0].text
 
 
+async def call_claude_vision(image_bytes: bytes, media_type: str, prompt: str) -> str:
+    """ส่งรูปให้ Claude วิเคราะห์"""
+    image_data = base64.standard_b64encode(image_bytes).decode("utf-8")
+    message = await claude_client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2048,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": image_data,
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": prompt,
+                }
+            ],
+        }],
+    )
+    return message.content[0].text
+
+
 # ─────────────────────────────────────────
 # Keyboards
 # ─────────────────────────────────────────
@@ -276,6 +304,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """รับรูปภาพ JPG/PNG แล้วส่งให้ Claude วิเคราะห์"""
+    user_id = update.message.from_user.id
+    caption = update.message.caption or "อธิบายรูปนี้ให้ละเอียด"
+
+    msg = await update.message.reply_text("🖼️ ได้รับรูปแล้ว กำลังส่งให้ Claude วิเคราะห์...")
+
+    try:
+        # ดาวน์โหลดรูปขนาดใหญ่สุด
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(file.file_path)
+            image_bytes = response.content
+
+        result = await call_claude_vision(image_bytes, "image/jpeg", caption)
+        user_state[user_id] = result
+
+        logger.info(f"[{user_id}] vision responded ({len(result)} chars)")
+
+        chunks = [result[i:i+3800] for i in range(0, len(result), 3800)]
+        for i, chunk in enumerate(chunks):
+            is_last = i == len(chunks) - 1
+            suffix = f"\n\n_(ส่วนที่ {i+1}/{len(chunks)})_" if len(chunks) > 1 else ""
+            await context.bot.send_message(
+                chat_id=update.message.chat_id,
+                text=f"✨ *Claude วิเคราะห์รูป:*\n\n{chunk}{suffix}",
+                reply_markup=next_action_keyboard() if is_last else None,
+                parse_mode="Markdown",
+            )
+
+    except Exception as e:
+        logger.error(f"Vision error: {e}")
+        await msg.edit_text(f"❌ เกิดข้อผิดพลาด: {str(e)}")
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -344,6 +409,7 @@ def main():
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("announce", cmd_announce))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_error_handler(error_handler)
 
