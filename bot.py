@@ -181,9 +181,45 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 สวัสดี!\n\nพิมพ์ prompt ได้เลย แล้วเลือกว่าจะส่งให้ AI ไหน\n"
         "จากนั้นเลือกได้ว่าจะส่ง output ต่อให้ใครอีก หรือจบเลย\n\n"
+        "พิมพ์ /help เพื่อดูคำสั่งทั้งหมด"
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 วิธีใช้งาน\n\n"
+        "1. พิมพ์ prompt ที่ต้องการ\n"
+        "2. เลือกว่าจะให้ Perplexity หรือ Claude ตอบ\n"
+        "3. พอได้คำตอบแล้ว เลือกส่งต่อให้ AI อีกตัว หรือกด จบ\n\n"
         "คำสั่ง:\n"
-        "/ping — ทดสอบว่า AI ทุกตัวใช้งานได้ไหม\n"
-        "/announce [ข้อความ] — broadcast ข้อความถึงทุกคน (admin only)"
+        "/help — แสดงวิธีใช้งาน\n"
+        "/clear — ล้าง prompt ปัจจุบัน เริ่มใหม่ได้เลย\n"
+        "/retry — ส่ง prompt เดิมซ้ำอีกครั้ง\n"
+        "/ping — ทดสอบว่า AI ทุกตัวพร้อมใช้งานไหม"
+    )
+
+
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id in user_state:
+        user_state.pop(user_id)
+        await update.message.reply_text("🧹 ล้างแล้ว พิมพ์ prompt ใหม่ได้เลย")
+    else:
+        await update.message.reply_text("ไม่มี prompt ค้างอยู่ พิมพ์ได้เลย")
+
+
+async def cmd_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    last = user_state.get(user_id)
+
+    if not last:
+        await update.message.reply_text("❌ ไม่มี prompt ก่อนหน้า พิมพ์ใหม่ได้เลย")
+        return
+
+    preview = last[:120] + "..." if len(last) > 120 else last
+    await update.message.reply_text(
+        f"🔁 ส่งซ้ำ:\n{preview}\n\nส่งให้ใคร?",
+        reply_markup=choose_ai_keyboard(),
     )
 
 
@@ -302,6 +338,9 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(on_startup).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CommandHandler("retry", cmd_retry))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("announce", cmd_announce))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
