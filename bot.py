@@ -7,6 +7,8 @@ import logging
 import asyncio
 from datetime import datetime
 import httpx
+import boto3
+from botocore.exceptions import ClientError
 import fitz  # pymupdf
 import docx
 import openpyxl
@@ -32,6 +34,11 @@ ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))  # group สำหรับ broadcast
 USERS_FILE = "known_users.json"
 LOG_FILE = "logs/activity.csv"
+S3_BUCKET = os.getenv("AWS_S3_BUCKET")
+AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-1")
+
+# S3 client (ใช้ IAM Role อัตโนมัติ ไม่ต้องใส่ key)
+s3 = boto3.client("s3", region_name=AWS_REGION) if S3_BUCKET else None
 
 # --- Logging ---
 logging.basicConfig(
@@ -45,6 +52,37 @@ claude_client = AsyncAnthropic(api_key=CLAUDE_API_KEY)
 
 # --- State ---
 user_state: dict[int, str] = {}
+
+
+# ─────────────────────────────────────────
+# S3 Helpers
+# ─────────────────────────────────────────
+
+def s3_upload_file(local_path: str, s3_key: str):
+    """อัปโหลดไฟล์ขึ้น S3"""
+    if not s3 or not os.path.exists(local_path):
+        return
+    try:
+        s3.upload_file(local_path, S3_BUCKET, s3_key)
+        logger.info(f"S3 uploaded: {s3_key}")
+    except ClientError as e:
+        logger.error(f"S3 upload failed: {e}")
+
+
+def s3_upload_bytes(data: bytes, s3_key: str, content_type: str = "application/octet-stream"):
+    """อัปโหลด bytes ขึ้น S3 (สำหรับไฟล์จาก Telegram)"""
+    if not s3:
+        return
+    try:
+        s3.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=data, ContentType=content_type)
+        logger.info(f"S3 uploaded: {s3_key}")
+    except ClientError as e:
+        logger.error(f"S3 upload failed: {e}")
+
+
+def s3_sync_log():
+    """sync log CSV ขึ้น S3"""
+    s3_upload_file(LOG_FILE, "logs/activity.csv")
 
 
 # ─────────────────────────────────────────
@@ -127,8 +165,18 @@ async def notify_admin(app, message: str):
 # Startup / Error
 # ─────────────────────────────────────────
 
+async def periodic_log_sync(app):
+    """sync log ขึ้น S3 ทุก 1 ชั่วโมง"""
+    while True:
+        await asyncio.sleep(3600)
+        s3_sync_log()
+        logger.info("Periodic S3 log sync done")
+
+
 async def on_startup(app):
+    s3_sync_log()  # sync log ที่มีอยู่แล้วตอน startup
     await notify_admin(app, "✅ Bot เริ่มทำงานแล้ว")
+    asyncio.create_task(periodic_log_sync(app))
 
 
 async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
@@ -401,6 +449,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         logger.info(f"[{user_id}] file {filename} ({len(text)} chars)")
         write_log(user_id, update.message.from_user.username, "file_upload", filename)
+
+        # อัปโหลดไฟล์ต้นฉบับขึ้น S3
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        s3_key = f"uploads/{user_id}/{ts}_{filename}"
+        s3_upload_bytes(file_bytes, s3_key)
+        s3_sync_log()
+
         await msg.edit_text(
             f"📄 อ่าน *{filename}* แล้ว ({len(text):,} ตัวอักษร)\n\nส่งให้ใคร?",
             reply_markup=choose_ai_keyboard(),
@@ -433,6 +488,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         logger.info(f"[{user_id}] vision responded ({len(result)} chars)")
         write_log(user_id, update.message.from_user.username, "image_upload", caption)
+
+        # อัปโหลดรูปขึ้น S3
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        s3_key = f"uploads/{user_id}/{ts}_photo.jpg"
+        s3_upload_bytes(image_bytes, s3_key, content_type="image/jpeg")
+        s3_sync_log()
 
         chunks = [result[i:i+3800] for i in range(0, len(result), 3800)]
         for i, chunk in enumerate(chunks):
