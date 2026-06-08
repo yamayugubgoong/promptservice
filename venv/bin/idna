@@ -1,0 +1,10 @@
+#!/bin/sh
+'''exec' "/Users/ppys/Library/Application Support/Claude/local-agent-mode-sessions/79a03cfa-7e45-46a7-862a-be0c03330cd9/ff799d07-f5a3-458a-95af-f7ddd448feb5/local_0b66b2f2-4f47-4f16-8d88-54e1cf226c44/outputs/venv/bin/python3.12" "$0" "$@"
+' '''
+# -*- coding: utf-8 -*-
+import re
+import sys
+from idna.cli import main
+if __name__ == '__main__':
+    sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])
+    sys.exit(main())

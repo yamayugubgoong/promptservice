@@ -45,7 +45,7 @@ async def call_perplexity(prompt: str) -> str:
         "Content-Type": "application/json",
     }
     payload = {
-        "model": "llama-3.1-sonar-large-128k-online",
+        "model": "sonar",
         "messages": [{"role": "user", "content": prompt}],
     }
     async with httpx.AsyncClient(timeout=60) as client:
