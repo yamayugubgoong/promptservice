@@ -1,5 +1,7 @@
 import os
+import json
 import logging
+import asyncio
 import httpx
 from anthropic import AsyncAnthropic
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -19,6 +21,9 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))  # group สำหรับ broadcast
+USERS_FILE = "known_users.json"
 
 # --- Logging ---
 logging.basicConfig(
@@ -30,9 +35,79 @@ logger = logging.getLogger(__name__)
 # --- Clients ---
 claude_client = AsyncAnthropic(api_key=CLAUDE_API_KEY)
 
-# --- State (user_id -> last output) ---
-# เก็บ output ล่าสุดของแต่ละ user เพื่อส่งต่อให้ AI ถัดไป
+# --- State ---
 user_state: dict[int, str] = {}
+
+
+# ─────────────────────────────────────────
+# Known Users (persistent)
+# ─────────────────────────────────────────
+
+def load_known_users() -> set[int]:
+    """โหลด user_ids จาก file"""
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, "r") as f:
+            return set(json.load(f))
+    return set()
+
+def save_known_users(users: set[int]):
+    """บันทึก user_ids ลง file"""
+    with open(USERS_FILE, "w") as f:
+        json.dump(list(users), f)
+
+known_users: set[int] = load_known_users()
+
+
+# ─────────────────────────────────────────
+# Broadcast
+# ─────────────────────────────────────────
+
+async def broadcast(app, message: str):
+    """ส่งข้อความไปทุกที่ — admin, group, และ user ทุกคน"""
+    targets = set()
+
+    # admin
+    if ADMIN_CHAT_ID:
+        targets.add(ADMIN_CHAT_ID)
+
+    # group
+    if GROUP_CHAT_ID:
+        targets.add(GROUP_CHAT_ID)
+
+    # user ทุกคนที่เคย /start
+    targets.update(known_users)
+
+    for chat_id in targets:
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=message)
+            await asyncio.sleep(0.05)  # หลีกเลี่ยง rate limit
+        except Exception as e:
+            logger.warning(f"Broadcast failed for {chat_id}: {e}")
+
+
+async def notify_admin(app, message: str):
+    """ส่งแค่ admin คนเดียว (สำหรับ error ที่ไม่ต้องบอกทุกคน)"""
+    if ADMIN_CHAT_ID:
+        try:
+            await app.bot.send_message(chat_id=ADMIN_CHAT_ID, text=message)
+        except Exception as e:
+            logger.error(f"Failed to notify admin: {e}")
+
+
+# ─────────────────────────────────────────
+# Startup / Error
+# ─────────────────────────────────────────
+
+async def on_startup(app):
+    await notify_admin(app, "✅ Bot เริ่มทำงานแล้ว")
+
+
+async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Exception: {context.error}")
+    await notify_admin(
+        context.application,
+        f"🚨 Bot Error!\n\n{type(context.error).__name__}: {str(context.error)[:300]}"
+    )
 
 
 # ─────────────────────────────────────────
@@ -72,7 +147,6 @@ async def call_claude(prompt: str) -> str:
 # ─────────────────────────────────────────
 
 def choose_ai_keyboard() -> InlineKeyboardMarkup:
-    """ปุ่มเลือก AI ครั้งแรก"""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🔍 Perplexity", callback_data="ai:perplexity"),
@@ -82,7 +156,6 @@ def choose_ai_keyboard() -> InlineKeyboardMarkup:
 
 
 def next_action_keyboard() -> InlineKeyboardMarkup:
-    """ปุ่มหลังได้ผลลัพธ์ — ส่งต่อหรือจบ"""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🔍 ส่งต่อ Perplexity", callback_data="ai:perplexity"),
@@ -97,20 +170,66 @@ def next_action_keyboard() -> InlineKeyboardMarkup:
 # ─────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+
+    # บันทึก user ลง file
+    if user_id not in known_users:
+        known_users.add(user_id)
+        save_known_users(known_users)
+        logger.info(f"New user: {user_id} @{update.message.from_user.username}")
+
     await update.message.reply_text(
         "👋 สวัสดี!\n\nพิมพ์ prompt ได้เลย แล้วเลือกว่าจะส่งให้ AI ไหน\n"
-        "จากนั้นเลือกได้ว่าจะส่ง output ต่อให้ใครอีก หรือจบเลย"
+        "จากนั้นเลือกได้ว่าจะส่ง output ต่อให้ใครอีก หรือจบเลย\n\n"
+        "คำสั่ง:\n"
+        "/ping — ทดสอบว่า AI ทุกตัวใช้งานได้ไหม\n"
+        "/announce [ข้อความ] — broadcast ข้อความถึงทุกคน (admin only)"
     )
+
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("🔄 กำลังทดสอบ AI ทุกตัว...")
+    results = {}
+
+    try:
+        await call_perplexity("reply with only the word: pong")
+        results["Perplexity"] = "✅ OK"
+    except Exception as e:
+        results["Perplexity"] = f"❌ {str(e)[:80]}"
+
+    try:
+        await call_claude("reply with only the word: pong")
+        results["Claude"] = "✅ OK"
+    except Exception as e:
+        results["Claude"] = f"❌ {str(e)[:80]}"
+
+    report = "\n".join([f"{ai}: {status}" for ai, status in results.items()])
+    await msg.edit_text(f"🏓 Ping Results:\n\n{report}")
+
+
+async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin เท่านั้น — broadcast ข้อความถึงทุกคน"""
+    user_id = update.message.from_user.id
+
+    if user_id != ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ คำสั่งนี้ใช้ได้เฉพาะ admin")
+        return
+
+    text = " ".join(context.args)
+    if not text:
+        await update.message.reply_text("Usage: /announce ข้อความที่จะส่ง")
+        return
+
+    await update.message.reply_text(f"📢 กำลัง broadcast...")
+    await broadcast(context.application, f"📢 ประกาศ:\n\n{text}")
+    await update.message.reply_text(f"✅ ส่งถึง {len(known_users)} user แล้ว")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     prompt = update.message.text
 
-    # เก็บ prompt เป็น input เริ่มต้น
     user_state[user_id] = prompt
-
-    # Log
     logger.info(f"[{user_id}] @{update.message.from_user.username} prompt: {prompt[:80]}")
 
     preview = prompt[:120] + "..." if len(prompt) > 120 else prompt
@@ -126,22 +245,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     user_id = query.from_user.id
-    action = query.data  # "ai:perplexity" | "ai:claude" | "ai:done"
+    action = query.data
 
-    # จบ
     if action == "ai:done":
         await query.edit_message_text("✅ จบแล้ว! พิมพ์ prompt ใหม่ได้เลย")
         user_state.pop(user_id, None)
         return
 
-    # ดึง input ปัจจุบัน
     current_input = user_state.get(user_id)
     if not current_input:
         await query.edit_message_text("❌ หมด context แล้ว กรุณาพิมพ์ prompt ใหม่")
         return
 
     ai_name = "Perplexity" if action == "ai:perplexity" else "Claude"
-
     await query.edit_message_text(f"⏳ กำลังส่งให้ {ai_name}...")
 
     try:
@@ -150,19 +266,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             result = await call_claude(current_input)
 
-        # อัปเดต state เป็น output ล่าสุด (ใช้ส่งต่อรอบหน้า)
         user_state[user_id] = result
-
-        # Log
         logger.info(f"[{user_id}] {ai_name} responded ({len(result)} chars)")
 
-        # Telegram จำกัด 4096 ตัวอักษรต่อ message
         chunks = [result[i:i+3800] for i in range(0, len(result), 3800)]
-
         for i, chunk in enumerate(chunks):
             is_last = i == len(chunks) - 1
             suffix = f"\n\n_(ส่วนที่ {i+1}/{len(chunks)})_" if len(chunks) > 1 else ""
-
             await context.bot.send_message(
                 chat_id=query.message.chat_id,
                 text=f"✨ *ผลจาก {ai_name}:*\n\n{chunk}{suffix}",
@@ -189,11 +299,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────
 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(on_startup).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(CommandHandler("announce", cmd_announce))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_error_handler(error_handler)
 
     logger.info("🤖 Bot is running...")
     app.run_polling(drop_pending_updates=True)
