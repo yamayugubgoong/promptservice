@@ -1,9 +1,11 @@
 import os
 import io
+import csv
 import json
 import base64
 import logging
 import asyncio
+from datetime import datetime
 import httpx
 import fitz  # pymupdf
 import docx
@@ -29,6 +31,7 @@ CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))  # group สำหรับ broadcast
 USERS_FILE = "known_users.json"
+LOG_FILE = "logs/activity.csv"
 
 # --- Logging ---
 logging.basicConfig(
@@ -61,6 +64,27 @@ def save_known_users(users: set[int]):
         json.dump(list(users), f)
 
 known_users: set[int] = load_known_users()
+
+
+# ─────────────────────────────────────────
+# CSV Logger
+# ─────────────────────────────────────────
+
+def write_log(user_id: int, username: str, action: str, content: str):
+    """บันทึก activity ลง CSV"""
+    os.makedirs("logs", exist_ok=True)
+    file_exists = os.path.exists(LOG_FILE)
+    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["timestamp", "user_id", "username", "action", "content"])
+        writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            user_id,
+            username or "",
+            action,
+            content[:500],  # ตัดถ้ายาวเกิน
+        ])
 
 
 # ─────────────────────────────────────────
@@ -299,6 +323,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_state[user_id] = prompt
     logger.info(f"[{user_id}] @{update.message.from_user.username} prompt: {prompt[:80]}")
+    write_log(user_id, update.message.from_user.username, "prompt", prompt)
 
     preview = prompt[:120] + "..." if len(prompt) > 120 else prompt
     await update.message.reply_text(
@@ -375,6 +400,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_state[user_id] = prompt
 
         logger.info(f"[{user_id}] file {filename} ({len(text)} chars)")
+        write_log(user_id, update.message.from_user.username, "file_upload", filename)
         await msg.edit_text(
             f"📄 อ่าน *{filename}* แล้ว ({len(text):,} ตัวอักษร)\n\nส่งให้ใคร?",
             reply_markup=choose_ai_keyboard(),
@@ -406,6 +432,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_state[user_id] = result
 
         logger.info(f"[{user_id}] vision responded ({len(result)} chars)")
+        write_log(user_id, update.message.from_user.username, "image_upload", caption)
 
         chunks = [result[i:i+3800] for i in range(0, len(result), 3800)]
         for i, chunk in enumerate(chunks):
@@ -451,6 +478,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         user_state[user_id] = result
         logger.info(f"[{user_id}] {ai_name} responded ({len(result)} chars)")
+        write_log(user_id, query.from_user.username, f"{ai_name.lower()}_response", result)
 
         chunks = [result[i:i+3800] for i in range(0, len(result), 3800)]
         for i, chunk in enumerate(chunks):
