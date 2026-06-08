@@ -1,9 +1,13 @@
 import os
+import io
 import json
 import base64
 import logging
 import asyncio
 import httpx
+import fitz  # pymupdf
+import docx
+import openpyxl
 from anthropic import AsyncAnthropic
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -304,6 +308,84 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
+    """แปลงไฟล์เป็น text"""
+    ext = filename.lower().split(".")[-1]
+
+    if ext == "pdf":
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        return "\n".join(page.get_text() for page in doc)
+
+    elif ext in ("docx", "doc"):
+        doc = docx.Document(io.BytesIO(file_bytes))
+        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+
+    elif ext in ("xlsx", "xls"):
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+        lines = []
+        for sheet in wb.worksheets:
+            lines.append(f"[Sheet: {sheet.title}]")
+            for row in sheet.iter_rows(values_only=True):
+                row_text = "\t".join(str(c) if c is not None else "" for c in row)
+                if row_text.strip():
+                    lines.append(row_text)
+        return "\n".join(lines)
+
+    elif ext in ("csv", "txt"):
+        return file_bytes.decode("utf-8", errors="ignore")
+
+    else:
+        return None
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """รับไฟล์ PDF, Word, Excel, CSV, TXT"""
+    user_id = update.message.from_user.id
+    doc = update.message.document
+    filename = doc.file_name or "file"
+    caption = update.message.caption or "สรุปและวิเคราะห์เนื้อหาในไฟล์นี้"
+
+    supported = ("pdf", "docx", "doc", "xlsx", "xls", "csv", "txt")
+    ext = filename.lower().split(".")[-1]
+
+    if ext not in supported:
+        await update.message.reply_text(
+            f"❌ ไม่รองรับไฟล์ .{ext}\n\nรองรับ: PDF, Word, Excel, CSV, TXT"
+        )
+        return
+
+    msg = await update.message.reply_text(f"📄 ได้รับ {filename} กำลังอ่านไฟล์...")
+
+    try:
+        file = await context.bot.get_file(doc.file_id)
+        async with httpx.AsyncClient() as client:
+            response = await client.get(file.file_path)
+            file_bytes = response.content
+
+        text = extract_text_from_file(file_bytes, filename)
+        if not text or not text.strip():
+            await msg.edit_text("❌ อ่านไฟล์ไม่ได้หรือไฟล์ว่างเปล่า")
+            return
+
+        # ตัดถ้ายาวเกิน (Claude รับได้ประมาณ 100k chars)
+        if len(text) > 80000:
+            text = text[:80000] + "\n\n...(ตัดเนื้อหาที่เกิน)"
+
+        prompt = f"{caption}\n\n--- เนื้อหาจากไฟล์: {filename} ---\n{text}"
+        user_state[user_id] = prompt
+
+        logger.info(f"[{user_id}] file {filename} ({len(text)} chars)")
+        await msg.edit_text(
+            f"📄 อ่าน *{filename}* แล้ว ({len(text):,} ตัวอักษร)\n\nส่งให้ใคร?",
+            reply_markup=choose_ai_keyboard(),
+            parse_mode="Markdown",
+        )
+
+    except Exception as e:
+        logger.error(f"Document error: {e}")
+        await msg.edit_text(f"❌ เกิดข้อผิดพลาด: {str(e)}")
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """รับรูปภาพ JPG/PNG แล้วส่งให้ Claude วิเคราะห์"""
     user_id = update.message.from_user.id
@@ -410,6 +492,7 @@ def main():
     app.add_handler(CommandHandler("announce", cmd_announce))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_error_handler(error_handler)
 
